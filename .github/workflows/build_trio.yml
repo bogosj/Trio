@@ -365,23 +365,26 @@ jobs:
             ACQUIRE_ERR=$(echo "$ANNOTATIONS" | jq -r '
               [.[].message // "" | select(
                 test("not acquired by Runner"; "i") or
-                test("capacity constraints.*macos"; "i") or
                 test("failed to receive a runner"; "i")
               )] | length
             ')
 
+            # A job only starved for a runner if no runner was assigned (runner_id == 0/null),
+            # no steps ran, or GitHub explicitly reported that the job was not acquired by a runner.
+            # (Note: GitHub attaches a "Due to capacity constraints..." notice annotation to ALL queued
+            # macOS jobs during peak hours, even when a runner IS acquired and fails later in Fastlane/Xcode.)
             if [ "$RUNNER_ID" = "0" ] || [ "$RUNNER_ID" = "null" ] || [ "$STEPS_COUNT" -eq 0 ] || [ "$ACQUIRE_ERR" -gt 0 ]; then
               echo "::warning::Job '$JOB_NAME' (ID: $JOB_ID) failed due to macOS runner unavailability (runner_id=$RUNNER_ID, steps=$STEPS_COUNT, annotations=$ACQUIRE_ERR)."
               STARVED=true
             else
-              echo "Job '$JOB_NAME' (ID: $JOB_ID) ran on runner $RUNNER_ID and failed during execution (not a runner starvation issue)."
+              echo "Job '$JOB_NAME' (ID: $JOB_ID) ran on runner $RUNNER_ID ($STEPS_COUNT steps) and failed during execution (not a runner starvation issue)."
               NON_STARVED_FAILURE=true
             fi
           done <<< "$FAILED_JOBS"
 
           # Only retry if starvation occurred and no real code/cert/secret failure happened
           if [ "$STARVED" != "true" ] || [ "$NON_STARVED_FAILURE" = "true" ]; then
-            echo "Failure was not caused purely by runner unavailability. Will not auto-retry."
+            echo "Failure was not caused by runner unavailability. Exiting immediately without retry."
             exit 0
           fi
 
