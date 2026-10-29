@@ -2,6 +2,12 @@ name: 4. Build Trio
 run-name: Build Trio (${{ github.ref_name }})
 on:
   workflow_dispatch:
+    inputs:
+      retry_attempt:
+        description: "Automated retry attempt counter (leave as 0 for manual runs)"
+        required: false
+        default: "0"
+        type: string
   schedule:
     # Check for updates every Sunday
     #   Later logic builds if there are updates or if it is the 2nd Sunday of the month
@@ -302,3 +308,105 @@ jobs:
           path: |
             artifacts
             buildlog
+
+  # Sentinel job: detects macOS runner starvation on manual runs and retries with exponential backoff
+  runner_sentinel:
+    name: Runner Availability Sentinel
+    needs: [check_status, check_certs, build]
+    if: |
+      always() &&
+      github.event_name == 'workflow_dispatch' &&
+      (needs.check_certs.result == 'failure' || needs.check_certs.result == 'cancelled' ||
+       needs.build.result == 'failure' || needs.build.result == 'cancelled')
+    runs-on: ubuntu-26.04
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT || github.token }}
+      RETRY_ATTEMPT: ${{ inputs.retry_attempt || '0' }}
+      MAX_RETRIES: "4"
+      BASE_DELAY_SECONDS: "300" # 5 minutes base (5m -> 10m -> 20m -> 40m)
+    steps:
+      - name: Inspect failed jobs for macOS runner starvation
+        run: |
+          set -euo pipefail
+
+          ATTEMPT="${RETRY_ATTEMPT:-0}"
+          if ! [[ "$ATTEMPT" =~ ^[0-9]+$ ]]; then ATTEMPT=0; fi
+
+          echo "Inspecting run ${{ github.run_id }} (attempt $((ATTEMPT + 1)))..."
+
+          # Fetch all jobs for this workflow run (including reusable workflow jobs)
+          JOBS_JSON=$(gh api "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100")
+
+          # Find jobs that failed, cancelled, or timed out (excluding this sentinel job)
+          FAILED_JOBS=$(echo "$JOBS_JSON" | jq -c '
+            .jobs[] |
+            select(.name != "Runner Availability Sentinel") |
+            select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out")
+          ')
+
+          if [ -z "$FAILED_JOBS" ]; then
+            echo "No failed jobs found to evaluate."
+            exit 0
+          fi
+
+          STARVED=false
+          NON_STARVED_FAILURE=false
+
+          while IFS= read -r job; do
+            JOB_ID=$(echo "$job" | jq -r '.id')
+            JOB_NAME=$(echo "$job" | jq -r '.name')
+            RUNNER_ID=$(echo "$job" | jq -r '.runner_id // 0')
+            STEPS_COUNT=$(echo "$job" | jq -r '.steps | length')
+
+            # Fetch check-run annotations to look for hosted runner acquisition failure messages
+            ANNOTATIONS=$(gh api "/repos/${{ github.repository }}/check-runs/${JOB_ID}/annotations" 2>/dev/null || echo "[]")
+            ACQUIRE_ERR=$(echo "$ANNOTATIONS" | jq -r '
+              [.[].message // "" | select(
+                test("not acquired by Runner"; "i") or
+                test("capacity constraints.*macos"; "i") or
+                test("failed to receive a runner"; "i")
+              )] | length
+            ')
+
+            if [ "$RUNNER_ID" = "0" ] || [ "$RUNNER_ID" = "null" ] || [ "$STEPS_COUNT" -eq 0 ] || [ "$ACQUIRE_ERR" -gt 0 ]; then
+              echo "::warning::Job '$JOB_NAME' (ID: $JOB_ID) failed due to macOS runner unavailability (runner_id=$RUNNER_ID, steps=$STEPS_COUNT, annotations=$ACQUIRE_ERR)."
+              STARVED=true
+            else
+              echo "Job '$JOB_NAME' (ID: $JOB_ID) ran on runner $RUNNER_ID and failed during execution (not a runner starvation issue)."
+              NON_STARVED_FAILURE=true
+            fi
+          done <<< "$FAILED_JOBS"
+
+          # Only retry if starvation occurred and no real code/cert/secret failure happened
+          if [ "$STARVED" != "true" ] || [ "$NON_STARVED_FAILURE" = "true" ]; then
+            echo "Failure was not caused purely by runner unavailability. Will not auto-retry."
+            exit 0
+          fi
+
+          if [ "$ATTEMPT" -ge "$MAX_RETRIES" ]; then
+            echo "::error::Maximum retry attempts ($MAX_RETRIES) reached for macOS runner starvation. Giving up."
+            exit 1
+          fi
+
+          NEXT_ATTEMPT=$((ATTEMPT + 1))
+          # Exponential backoff: BASE * 2^ATTEMPT + random jitter (0-60s)
+          BACKOFF=$(( BASE_DELAY_SECONDS * (1 << ATTEMPT) ))
+          JITTER=$(( RANDOM % 60 ))
+          WAIT_SECS=$(( BACKOFF + JITTER ))
+          WAIT_MINS=$(( WAIT_SECS / 60 ))
+
+          echo "### :hourglass_flowing_sand: macOS Runner Unavailable — Auto-Retry Scheduled" >> "$GITHUB_STEP_SUMMARY"
+          echo "GitHub Actions could not allocate a \`macos-26\` runner for this build." >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Retry Attempt:** ${NEXT_ATTEMPT} of ${MAX_RETRIES}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Backoff Delay:** ~${WAIT_MINS} minutes (${WAIT_SECS}s)" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Sleeping for ${WAIT_SECS}s (~${WAIT_MINS}m) before triggering retry #${NEXT_ATTEMPT}..."
+          sleep "$WAIT_SECS"
+
+          echo "Dispatching '4. Build Trio' on ref '${{ github.ref_name }}' (retry_attempt=${NEXT_ATTEMPT})..."
+          gh workflow run "build_trio.yml" \
+            --repo "${{ github.repository }}" \
+            --ref "${{ github.ref_name }}" \
+            -f retry_attempt="${NEXT_ATTEMPT}"
